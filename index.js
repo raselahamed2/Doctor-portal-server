@@ -5,6 +5,7 @@ const portal = process.env.PORT || 5000;
 const jwt = require('jsonwebtoken');
 const { query } = require('express');
 require('dotenv').config()
+const stripe = require("stripe")(process.env.SECRET_KEY);
 
 const app = express()
 
@@ -15,67 +16,67 @@ app.use(express.json())
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.ni7npsp.mongodb.net/?retryWrites=true&w=majority`;
 const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true, serverApi: ServerApiVersion.v1 });
 
-function verifyJwt(req, res, next){
-    console.log('token jwt', req.headers.authorization);
+function verifyJwt(req, res, next) {
     const authHeader = req.headers.authorization;
-    if(!authHeader){
+    if (!authHeader) {
         return res.send(401).send('unauthorized token')
     }
 
     const token = authHeader.split(' ')[1]
 
-    jwt.verify(token, process.env.ACCESS_TOKEN, function(err, decoded){
-        if(err){
-            return res.status(403).send({message: 'forbidden access'})
+    jwt.verify(token, process.env.ACCESS_TOKEN, function (err, decoded) {
+        if (err) {
+            return res.status(403).send({ message: 'forbidden access' })
         }
         req.decoded = decoded
         next()
     })
 }
 
-async function run(){
-    try{
+async function run() {
+    try {
         const drAppointmentCollection = client.db('doctorPortal').collection('drAppointment')
         const bookingsCollection = client.db('doctorPortal').collection('bookings')
         const usersCollection = client.db('doctorPortal').collection('users')
         const doctorsCollection = client.db('doctorPortal').collection('doctors')
+        const paymentsCollection = client.db('doctorPortal').collection('payments')
 
-        const verifyAdmin = async(req, res, next) => {
+        const verifyAdmin = async (req, res, next) => {
             console.log('make sure admin', req.params.email);
             const decodedEmail = req.decoded.email;
-            const query = {email: decodedEmail};
+            const query = { email: decodedEmail };
             const user = await usersCollection.findOne(query);
 
-            if(user?.role !== 'admin'){
-                return res.status(403).send({message: 'forbidden access'})
+            if (user?.role !== 'admin') {
+                return res.status(403).send({ message: 'forbidden access' })
             }
             next()
         }
 
-        app.get('/appointmentOption', async(req, res) =>{
-            const date= req.query.date;
+        app.get('/appointmentOption', async (req, res) => {
+            const date = req.query.date;
             const query = {}
             const options = await drAppointmentCollection.find(query).toArray()
-            const bookingQuery = {appointmentDate: date};
+            const bookingQuery = { appointmentDate: date };
             const alredyBooked = await bookingsCollection.find(bookingQuery).toArray();
             options.forEach(option => {
                 const optionBooked = alredyBooked.filter(book => book.treatmant === option.name)
                 const bookedSlots = optionBooked.map(book => book.slot);
                 const reminingSlots = option.slots.filter(slot => !bookedSlots.includes(slot))
-                option.slots= reminingSlots
+                option.slots = reminingSlots
             })
             res.send(options)
         })
 
-        app.get(('/v2/appointmentOption', async(req, res) => {
+        app.get(('/v2/appointmentOption', async (req, res) => {
             const date = req.query.data
             const options = await drAppointmentCollection.aggregate([
                 {
-                    $lokup:{
+                    $lokup: {
                         from: 'bookings',
                         localField: 'name',
                         foreignField: 'treatmant',
-                        pipeline: [ 
+                        pipeline: [
                             {
                                 $match: {
                                     $expr: {
@@ -83,13 +84,14 @@ async function run(){
                                     }
                                 }
                             }
-                         ],
+                        ],
                         as: 'booked'
                     }
                 },
                 {
                     $project: {
                         name: 1,
+                        price: 1,
                         slots: 1,
                         booked: {
                             $map: {
@@ -103,6 +105,7 @@ async function run(){
                 {
                     $project: {
                         name: 1,
+                        price: 1,
                         slots: {
                             $setDifference: ['$slots', '$booked']
                         }
@@ -112,28 +115,34 @@ async function run(){
             res.send(options)
         }))
 
-        app.get('/appointmentSpecitalty', async(req, res) =>{
+        app.get('/appointmentSpecitalty', async (req, res) => {
             const query = {}
-            const result = await drAppointmentCollection.find(query).project({name: 1}).toArray()
+            const result = await drAppointmentCollection.find(query).project({ name: 1 }).toArray()
             res.send(result)
         })
 
-        app.get('/bookings', verifyJwt,  async(req, res) => {
+        app.get('/bookings', verifyJwt, async (req, res) => {
             const email = req.query.email;
             const decodedEmail = req.decoded.email;
             console.log(email, decodedEmail);
-            if(email !== decodedEmail){
-                return res.status(403).send({message: 'forbidden access'})
+            if (email !== decodedEmail) {
+                return res.status(403).send({ message: 'forbidden access' })
             }
 
-            const query = {email: email}
+            const query = { email: email }
             const booking = await bookingsCollection.find(query).toArray();
             res.send(booking)
         })
 
-        app.post('/bookings', async(req, res) => {
+        app.get('/bookings/:id', async (req, res) => {
+            const id = req.params.id;
+            const query = { _id: ObjectId(id) }
+            const booking = await bookingsCollection.findOne(query);
+            res.send(booking)
+        })
+
+        app.post('/bookings', async (req, res) => {
             const bookings = req.body
-            console.log(bookings);
             const query = {
                 appointmentDate: bookings.appointmentDate,
                 email: bookings.email,
@@ -142,7 +151,7 @@ async function run(){
 
             const alreadyBooked = await bookingsCollection.find(query).toArray();
 
-            if(alreadyBooked.length){
+            if (alreadyBooked.length) {
                 const message = `You alredy booking ${bookings.appointmentDate}`
                 return res.send({ acknowledged: false, message })
             }
@@ -151,44 +160,42 @@ async function run(){
             res.send(result)
         })
 
-        app.get('/jwt', async(req, res) => {
+        app.get('/jwt', async (req, res) => {
             const email = req.query.email;
-            const query = {email: email}
+            const query = { email: email }
             const user = await usersCollection.findOne(query);
-            if(user){
-                const token = jwt.sign({email}, process.env.ACCESS_TOKEN, {expiresIn: '3d'})
-                return res.send({accessToken: token})
+            if (user) {
+                const token = jwt.sign({ email }, process.env.ACCESS_TOKEN, { expiresIn: '3d' })
+                return res.send({ accessToken: token })
             }
-            else{
-                res.status(403).send({accessToken: ''})
+            else {
+                res.status(403).send({ accessToken: '' })
             }
-            console.log(user);
         })
 
-        app.get('/users/admin/:email', async(req, res) =>{
+        app.get('/users/admin/:email', async (req, res) => {
             const email = req.params.email;
             const query = { email }
             const user = await usersCollection.findOne(query)
-            res.send({ isAdmin: user?.role === 'admin'})
+            res.send({ isAdmin: user?.role === 'admin' })
         })
 
-        app.get('/users', async(req, res) => {
+        app.get('/users', async (req, res) => {
             const query = {}
             const users = await usersCollection.find(query).toArray()
             res.send(users)
         })
 
-        app.post('/users', async(req, res) => {
+        app.post('/users', async (req, res) => {
             const user = req.body;
             const result = await usersCollection.insertOne(user);
             res.send(result)
         })
 
-        app.put('/users/admin/:id', verifyJwt, verifyAdmin, async(req, res) => {
+        app.put('/users/admin/:id', verifyJwt, verifyAdmin, async (req, res) => {
             const id = req.params.id
-            console.log(id);
-            const filter = { _id: ObjectId(id)}
-            const options = {upsert: true}
+            const filter = { _id: ObjectId(id) }
+            const options = { upsert: true }
             const updatedDoc = {
                 $set: {
                     role: 'admin'
@@ -198,27 +205,73 @@ async function run(){
             res.send(result)
         })
 
-        app.get('/doctors', verifyJwt, verifyAdmin, async(req, res) => {
+        app.get('/addPrice', async (req, res) => {
+            const filter = {}
+            const options = { upsert: true }
+            const updatedDoc = {
+                $set: {
+                    price: 99
+                }
+            }
+            const result = await drAppointmentCollection.updateMany(filter, updatedDoc, options)
+            res.send(result)
+        })
+
+        app.post('/create-payment-intent', async (req, res) => {
+            const booking = req.body;
+            const price = booking.price;
+            const amount = price * 100
+            const paymentIntent = await stripe.paymentIntents.create({
+                currency: "usd",
+                amount: amount,
+                "payment_method_types": [
+                    "card"
+                  ],
+            })
+            res.send({
+                clientSecret: paymentIntent.client_secret,
+              });
+        })
+
+        app.post('/payments', async(req, res) => {
+            const payment = req.body;
+            const result = await paymentsCollection.insertOne(payment);
+            const id = payment.bookingId;
+            console.log(id);
+            const filter = {_id: ObjectId(id)}
+            const updatedDoc = {
+                $set: {
+                    paid: true,
+                    transactionId: payment.transactionId
+                }
+            }
+            const updateResult = await bookingsCollection.updateOne(filter, updatedDoc);
+            console.log(updateResult);
+            res.send(result)
+            
+        })
+
+        app.get('/doctors', verifyJwt, verifyAdmin, async (req, res) => {
             const query = req.body;
             const doctors = await doctorsCollection.find(query).toArray()
             res.send(doctors)
         })
 
-        app.post('/doctors', verifyJwt, verifyAdmin, async(req, res) => {
+        app.post('/doctors', verifyJwt, verifyAdmin, async (req, res) => {
             const doctor = req.body;
             const result = await doctorsCollection.insertOne(doctor)
             res.send(result)
         })
 
-        app.delete('/doctors/:id', verifyJwt, verifyAdmin, async(req, res) =>{
+        app.delete('/doctors/:id', verifyJwt, verifyAdmin, async (req, res) => {
             const id = req.params.id;
-            const filter = {_id: ObjectId(id)}
+            const filter = { _id: ObjectId(id) }
             const result = await doctorsCollection.deleteOne(filter)
             res.send(result)
         })
 
     }
-    finally{
+    finally {
 
     }
 }
@@ -226,8 +279,8 @@ async function run(){
 run().catch(e => console.log(e))
 
 
-app.get('/', async(req, res) =>{
+app.get('/', async (req, res) => {
     res.send('server is running')
 })
 
-app.listen(portal , () => console.log(`doctor portal server is running ${portal}`))
+app.listen(portal, () => console.log(`doctor portal server is running ${portal}`))
